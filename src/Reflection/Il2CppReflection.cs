@@ -138,7 +138,22 @@ namespace UniverseLib
             if (fullname.StartsWith("System."))
                 fullname = $"Il2Cpp{fullname}";
 
+            // For Il2CppInterop: Types from Assembly-CSharp with empty namespace get put into "Il2Cpp" namespace
+            // So "PCFlashlight" (native) becomes "Il2Cpp.PCFlashlight" (managed)
             if (!AllTypes.TryGetValue(fullname, out Type monoType))
+            {
+                // Check if this is from Assembly-CSharp and has no namespace
+                string asmName = cppType.Assembly?.GetName()?.Name;
+                if (asmName == "Assembly-CSharp" && !fullname.Contains("."))
+                {
+                    // Try with "Il2Cpp." prefix
+                    string il2cppFullname = $"Il2Cpp.{fullname}";
+                    if (AllTypes.TryGetValue(il2cppFullname, out monoType))
+                        return monoType;
+                }
+            }
+
+            if (!AllTypes.TryGetValue(fullname, out monoType))
             {
                 // If it's not in our dictionary, it's most likely a bound generic type.
                 // Let's use GetType with the AssemblyQualifiedName, and fix System.* types to be Il2CppSystem.*
@@ -510,15 +525,215 @@ namespace UniverseLib
         {
             if (!cppClassPointers.TryGetValue(type.AssemblyQualifiedName, out il2cppPtr))
             {
-                il2cppPtr = (IntPtr)typeof(Il2CppClassPointerStore<>)
-                    .MakeGenericType(new[] { type })
-                    .GetField("NativeClassPtr", BF.Public | BF.Static)
-                    .GetValue(null);
+                // Check if this is a nested type with an ObfuscatedName attribute
+                // Accessing Il2CppClassPointerStore<T> triggers T's static constructor, which crashes for obfuscated nested types
+                bool isObfuscatedNestedType = false;
+                if (type.IsNested)
+                {
+                    try
+                    {
+                        // Check for ObfuscatedName attribute (safe to access CustomAttributes without triggering .cctor)
+                        foreach (CustomAttributeData att in type.CustomAttributes)
+                        {
+                            if (att.AttributeType == typeof(ObfuscatedNameAttribute))
+                            {
+                                string obfuscatedName = att.ConstructorArguments[0].Value.ToString();
+                                if (obfuscatedName.Contains("+"))
+                                {
+                                    isObfuscatedNestedType = true;
+                                    Universe.Log($"[Il2CppReflection] Detected obfuscated nested type: {type.FullName} (obfuscated: {obfuscatedName})");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // If we can't check attributes, assume nested types from Assembly-CSharp are obfuscated
+                        if (type.Assembly.GetName().Name.Contains("Assembly-CSharp"))
+                        {
+                            isObfuscatedNestedType = true;
+                            Universe.Log($"[Il2CppReflection] Assuming nested Assembly-CSharp type is obfuscated: {type.FullName}");
+                        }
+                    }
+                }
 
-                cppClassPointers.Add(type.AssemblyQualifiedName, il2cppPtr);
+                if (isObfuscatedNestedType)
+                {
+                    // Skip Il2CppClassPointerStore to avoid triggering static constructor
+                    Universe.Log($"[Il2CppReflection] Bypassing Il2CppClassPointerStore for obfuscated nested type: {type.FullName}");
+                    il2cppPtr = GetClassPointerWithoutStaticConstructor(type);
+                    if (il2cppPtr != IntPtr.Zero)
+                        cppClassPointers.Add(type.AssemblyQualifiedName, il2cppPtr);
+                }
+                else
+                {
+                    try
+                    {
+                        il2cppPtr = (IntPtr)typeof(Il2CppClassPointerStore<>)
+                            .MakeGenericType(new[] { type })
+                            .GetField("NativeClassPtr", BF.Public | BF.Static)
+                            .GetValue(null);
+
+                        cppClassPointers.Add(type.AssemblyQualifiedName, il2cppPtr);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Obfuscated type with problematic static constructor - get pointer via IL2CPP native APIs instead
+                        Universe.LogWarning($"[Il2CppReflection] Exception accessing Il2CppClassPointerStore for {type.FullName}: {ex.GetType().Name} - {ex.Message}");
+                        il2cppPtr = GetClassPointerWithoutStaticConstructor(type);
+                        if (il2cppPtr != IntPtr.Zero)
+                            cppClassPointers.Add(type.AssemblyQualifiedName, il2cppPtr);
+                    }
+                }
             }
 
             return il2cppPtr != IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Gets the IL2CPP class pointer for a type without triggering its static constructor.
+        /// This bypasses the managed type system and uses native IL2CPP APIs directly.
+        /// </summary>
+        private static IntPtr GetClassPointerWithoutStaticConstructor(Type type)
+        {
+            try
+            {
+                // Get the obfuscated name if this type has one
+                string className = type.Name;
+                string namespaceName = type.Namespace ?? "";
+                string obfuscatedFullName = null;
+
+                // Check if this type has an ObfuscatedName attribute
+                foreach (CustomAttributeData att in type.CustomAttributes)
+                {
+                    if (att.AttributeType == typeof(ObfuscatedNameAttribute))
+                    {
+                        obfuscatedFullName = att.ConstructorArguments[0].Value.ToString();
+                        break;
+                    }
+                }
+
+                // Get the assembly name
+                string assemblyName = type.Assembly.GetName().Name;
+
+                // Extract the actual assembly name (remove Il2Cpp prefix and any unicode)
+                string actualAssembly = "Assembly-CSharp.dll"; // Most game assemblies
+                if (assemblyName.Contains("UnityEngine"))
+                    actualAssembly = "UnityEngine.CoreModule.dll";
+                else if (assemblyName.Contains("mscorlib"))
+                    actualAssembly = "mscorlib.dll";
+
+                // Search for the assembly image
+                IntPtr domain = IL2CPP.il2cpp_domain_get();
+                uint assemblyCount = 0;
+                IntPtr image = IntPtr.Zero;
+
+                unsafe
+                {
+                    IntPtr* assembliesPtr = IL2CPP.il2cpp_domain_get_assemblies(domain, ref assemblyCount);
+
+                    for (uint i = 0; i < assemblyCount; i++)
+                    {
+                        IntPtr assembly = assembliesPtr[i];
+                        IntPtr img = IL2CPP.il2cpp_assembly_get_image(assembly);
+                        string imageName = Marshal.PtrToStringAnsi(IL2CPP.il2cpp_image_get_name(img));
+
+                        if (imageName == actualAssembly)
+                        {
+                            image = img;
+                            break;
+                        }
+                    }
+                }
+
+                if (image == IntPtr.Zero)
+                    return IntPtr.Zero;
+
+                // Handle nested types (ObfuscatedName contains "+")
+                if (obfuscatedFullName != null && obfuscatedFullName.Contains("+"))
+                {
+                    string[] parts = obfuscatedFullName.Split('+');
+
+                    // First get the parent class
+                    string parentObfuscatedName = parts[0];
+                    string parentNamespace = "";
+                    string parentClass = parentObfuscatedName;
+
+                    // Check if parent has namespace
+                    int lastDot = parentObfuscatedName.LastIndexOf('.');
+                    if (lastDot > 0)
+                    {
+                        parentNamespace = parentObfuscatedName.Substring(0, lastDot);
+                        parentClass = parentObfuscatedName.Substring(lastDot + 1);
+                    }
+
+                    IntPtr parentClassPtr = IL2CPP.il2cpp_class_from_name(image, parentNamespace, parentClass);
+                    if (parentClassPtr == IntPtr.Zero)
+                    {
+                        Universe.LogWarning($"[Il2CppReflection] Could not find parent class {parentClass} for nested type {type.Name}");
+                        return IntPtr.Zero;
+                    }
+
+                    // Now find the nested type
+                    string nestedObfuscatedName = parts[parts.Length - 1];
+                    IntPtr nestedIter = IntPtr.Zero;
+                    IntPtr nestedType;
+
+                    Universe.Log($"[Il2CppReflection] Searching for nested type '{nestedObfuscatedName}' in parent class '{parentClass}'");
+                    Universe.Log($"[Il2CppReflection] Parent class pointer: 0x{parentClassPtr.ToInt64():X}");
+
+                    int nestedTypeCount = 0;
+                    while ((nestedType = IL2CPP.il2cpp_class_get_nested_types(parentClassPtr, ref nestedIter)) != IntPtr.Zero)
+                    {
+                        string nestedName = Marshal.PtrToStringAnsi(IL2CPP.il2cpp_class_get_name(nestedType));
+                        nestedTypeCount++;
+
+                        Universe.Log($"[Il2CppReflection]   Found nested type #{nestedTypeCount}: '{nestedName}'");
+
+                        if (nestedName == nestedObfuscatedName)
+                        {
+                            Universe.Log($"[Il2CppReflection] ✓ Found nested class pointer for {type.Name} via native APIs (bypassed static constructor)");
+                            return nestedType;
+                        }
+                    }
+
+                    Universe.LogWarning($"[Il2CppReflection] Could not find nested type '{nestedObfuscatedName}' in parent class '{parentClass}' (searched {nestedTypeCount} nested types)");
+                    return IntPtr.Zero;
+                }
+
+                // Handle regular (non-nested) types
+                if (obfuscatedFullName != null)
+                {
+                    // Parse namespace and class name from obfuscated name
+                    int lastDot = obfuscatedFullName.LastIndexOf('.');
+                    if (lastDot > 0)
+                    {
+                        namespaceName = obfuscatedFullName.Substring(0, lastDot);
+                        className = obfuscatedFullName.Substring(lastDot + 1);
+                    }
+                    else
+                    {
+                        className = obfuscatedFullName;
+                    }
+                }
+
+                // Try to find the class by name
+                IntPtr classPtr = IL2CPP.il2cpp_class_from_name(image, namespaceName, className);
+
+                if (classPtr != IntPtr.Zero)
+                {
+                    Universe.Log($"[Il2CppReflection] Found class pointer for {type.Name} via native APIs (bypassed static constructor)");
+                    return classPtr;
+                }
+
+                return IntPtr.Zero;
+            }
+            catch (Exception ex)
+            {
+                Universe.LogWarning($"[Il2CppReflection] Failed to get class pointer for {type.Name} via native APIs: {ex.Message}");
+                return IntPtr.Zero;
+            }
         }
 
 #endregion

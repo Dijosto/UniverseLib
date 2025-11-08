@@ -45,15 +45,25 @@ namespace UniverseLib
         private delegate IntPtr d_LoadFromMemory(IntPtr binary, uint crc);
 
         [HideFromIl2Cpp]
-        public static AssetBundle LoadFromMemory(byte[] binary, uint crc = 0)
-        {
-            IntPtr ptr = ICallManager.GetICallUnreliable<d_LoadFromMemory>(
-                    "UnityEngine.AssetBundle::LoadFromMemory_Internal",
-                    "UnityEngine.AssetBundle::LoadFromMemory")
-                .Invoke(((Il2CppStructArray<byte>)binary).Pointer, crc);
+      public static AssetBundle LoadFromMemory(byte[] binary, uint crc = 0)
+  {
+      // Keep the Il2Cpp array alive to prevent GC collection during the native call
+      Il2CppStructArray<byte> il2cppArray = binary;
+      try
+      {
+          IntPtr ptr = ICallManager.GetICallUnreliable<d_LoadFromMemory>(
+                  "UnityEngine.AssetBundle::LoadFromMemory_Internal",
+                  "UnityEngine.AssetBundle::LoadFromMemory")
+              .Invoke(il2cppArray.Pointer, crc);
 
-            return ptr != IntPtr.Zero ? new AssetBundle(ptr) : null;
-        }
+          return ptr != IntPtr.Zero ? new AssetBundle(ptr) : null;
+      }
+      finally
+      {
+          // Ensure the array stays alive until after the native call completes
+          GC.KeepAlive(il2cppArray);
+      }
+  }
 
         // AssetBundle.GetAllLoadedAssetBundles()
 

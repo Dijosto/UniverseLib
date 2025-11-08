@@ -21,8 +21,8 @@
         <TargetFramework>net6</TargetFramework>
         <OutputPath>..\Release\UniverseLib.Il2Cpp\</OutputPath>
         <DefineConstants>IL2CPP</DefineConstants>
-        <AssemblyName>UniverseLib.IL2CPP</AssemblyName>
-        <DocumentationFile>..\Release\UniverseLib.Il2Cpp\UniverseLib.IL2CPP.xml</DocumentationFile>
+        <AssemblyName>UniverseLib.IL2CPP.Interop.ML</AssemblyName>
+        <DocumentationFile>..\Release\UniverseLib.Il2Cpp\UniverseLib.IL2CPP.Interop.ML.xml</DocumentationFile>
     </PropertyGroup>
     <PropertyGroup Condition=" '$(Configuration)' == 'Release_Mono' ">
         <TargetFramework>net35</TargetFramework>
